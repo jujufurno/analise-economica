@@ -136,7 +136,7 @@ def construir_painel_mensal(dados: dict) -> pd.DataFrame:
 
 def grafico_painel_series(painel: pd.DataFrame):
     """Painel com as principais séries temporais."""
-    fig, axes = plt.subplots(4, 2, figsize=(14, 16), sharex=True)
+    fig, axes = plt.subplots(4, 2, figsize=(14, 16))
     fig.suptitle("Séries Temporais — Variáveis da Pesquisa (2012–2025)", fontsize=14, fontweight="bold", y=0.98)
 
     configs = [

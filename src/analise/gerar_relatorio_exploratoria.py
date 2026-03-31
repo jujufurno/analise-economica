@@ -1,47 +1,462 @@
 """
-Gera relatório HTML interativo da análise exploratória.
+Gera relatório HTML interativo da análise exploratória com gráficos Plotly.
 
-Converte os gráficos gerados e os resultados estatísticos em uma página
-HTML autocontida com navegação e análise interpretativa.
+Converte os dados em gráficos interativos (hover para ver valores) e inclui
+tooltips informativos (ℹ) para cada seção.
 
 Uso:
     python -m src.analise.gerar_relatorio_exploratoria
 """
 
-import base64
+import json
 import webbrowser
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from scipy import stats
+from statsmodels.tsa.stattools import adfuller, kpss
 
-GRAFICOS = Path("resultados/graficos")
+DADOS = Path("dados/processados")
 TABELAS = Path("resultados/tabelas")
 SAIDA = Path("resultados/relatorio_exploratoria.html")
 
+CORES = {
+    "endividamento": "#c0392b",
+    "comprometimento": "#e74c3c",
+    "icc": "#2980b9",
+    "icc_atuais": "#3498db",
+    "icc_expect": "#85c1e9",
+    "ipca": "#e67e22",
+    "selic": "#8e44ad",
+    "desemprego": "#27ae60",
+    "renda": "#16a085",
+    "spread": "#d35400",
+    "inadimplencia": "#c0392b",
+    "peic_endiv": "#e74c3c",
+    "peic_atraso": "#f39c12",
+    "peic_renda": "#d35400",
+}
 
-def img_to_base64(caminho: Path) -> str:
-    """Converte imagem para base64 inline."""
-    with open(caminho, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
+# Tooltips explicativos para cada seção
+TOOLTIPS = {
+    "series": (
+        "Este painel mostra a evolução de 8 variáveis macroeconômicas entre 2012 e 2025. "
+        "As áreas cinza marcam a recessão de 2014–16 e a pandemia de 2020. "
+        "Passe o mouse sobre as linhas para ver o valor exato em cada mês."
+    ),
+    "hipotese": (
+        "Gráficos de dois eixos sobrepondo medidas de endividamento e confiança do consumidor. "
+        "Se a hipótese for verdadeira, esperamos uma relação inversa: quando o endividamento sobe, "
+        "a confiança cai. Passe o mouse para comparar os valores mês a mês."
+    ),
+    "correlacoes": (
+        "A matriz de correlação de Pearson mede a associação linear entre pares de variáveis. "
+        "Valores próximos de +1 indicam correlação positiva forte; próximos de -1, negativa forte; "
+        "próximos de 0, ausência de associação linear. Passe o mouse para ver o valor exato."
+    ),
+    "crosscorr": (
+        "A cross-correlation mostra como a correlação entre duas variáveis muda conforme "
+        "deslocamos uma delas no tempo (lags). Lag positivo = endividamento precede ICC; "
+        "lag negativo = ICC precede endividamento. Isso ajuda a inferir precedência temporal."
+    ),
+    "scatter": (
+        "Os gráficos de dispersão mostram cada observação mensal como um ponto, permitindo "
+        "visualizar o formato da relação entre endividamento e confiança. A linha tracejada "
+        "é a regressão linear simples. Passe o mouse para ver a data e os valores de cada ponto."
+    ),
+    "estacionariedade": (
+        "Testes ADF (H₀: raiz unitária) e KPSS (H₀: estacionária) verificam se as séries "
+        "têm média constante ao longo do tempo. Séries não estacionárias precisam ser diferenciadas. "
+        "I(0) = estacionária em nível; I(1) = estacionária após 1ª diferença."
+    ),
+    "descritivas": (
+        "Estatísticas descritivas resumem a distribuição de cada variável: N (observações), "
+        "média, desvio-padrão (dispersão), mínimo, mediana e máximo."
+    ),
+    "sintese": (
+        "Síntese dos achados exploratórios e suas implicações para a modelagem econométrica "
+        "na próxima fase da pesquisa."
+    ),
+}
 
+
+# ============================================================
+# Carregamento dos dados (replicado de exploratoria.py)
+# ============================================================
+
+def carregar_dados() -> dict[str, pd.Series]:
+    dados = {}
+    for nome in ["endividamento_familias", "comprometimento_renda", "ipca_mensal",
+                  "selic_meta", "spread_medio_pf", "inadimplencia_pf",
+                  "credito_pf_saldo", "credito_pf_concessoes"]:
+        df = pd.read_parquet(DADOS / f"bcb_{nome}_mensal.parquet")
+        dados[nome] = df["valor"]
+
+    icc = pd.read_parquet(DADOS / "icc_confianca_consumidor_mensal.parquet")
+    dados["icc_indice"] = icc["icc_indice"]
+    dados["icc_condicoes_atuais"] = icc["icc_condicoes_atuais"]
+    dados["icc_expectativas"] = icc["icc_expectativas"]
+
+    peic = pd.read_parquet(DADOS / "peic_endividamento_mensal.parquet")
+    for col in peic.columns:
+        dados[col] = peic[col]
+
+    for nome, arq in [("desemprego", "ibge_desemprego_trimestral"),
+                       ("rendimento_medio", "ibge_rendimento_medio_trimestral")]:
+        df = pd.read_parquet(DADOS / f"{arq}.parquet")
+        dados[nome] = df["valor"]
+
+    return dados
+
+
+def construir_painel_mensal(dados: dict) -> pd.DataFrame:
+    series_mensais = {
+        "endividamento_bcb": dados["endividamento_familias"],
+        "comprometimento_renda": dados["comprometimento_renda"],
+        "icc_indice": dados["icc_indice"],
+        "icc_condicoes_atuais": dados["icc_condicoes_atuais"],
+        "icc_expectativas": dados["icc_expectativas"],
+        "ipca": dados["ipca_mensal"],
+        "selic": dados["selic_meta"],
+        "spread_pf": dados["spread_medio_pf"],
+        "inadimplencia": dados["inadimplencia_pf"],
+        "peic_endividadas": dados["pct_familias_endividadas"],
+        "peic_atraso": dados["pct_dividas_em_atraso"],
+        "peic_renda_comp": dados["pct_renda_comprometida_divida"],
+    }
+    painel = pd.DataFrame(series_mensais)
+
+    for nome in ["desemprego", "rendimento_medio"]:
+        s = dados[nome].copy()
+        s = s.resample("MS").first()
+        s = s.reindex(painel.index).interpolate(method="linear")
+        painel[nome] = s
+
+    painel = painel[painel.index >= "2012-01-01"]
+    return painel
+
+
+# ============================================================
+# Gráficos Plotly
+# ============================================================
+
+def _recessao_shapes(yref="y"):
+    """Retorna shapes para marcar recessão e pandemia."""
+    shapes = []
+    for inicio, fim in [("2014-04-01", "2016-12-31"), ("2020-03-01", "2020-12-31")]:
+        shapes.append(dict(
+            type="rect", xref="x", yref="paper",
+            x0=inicio, x1=fim, y0=0, y1=1,
+            fillcolor="gray", opacity=0.08, line_width=0,
+        ))
+    return shapes
+
+
+def fig_painel_series(painel: pd.DataFrame) -> str:
+    configs = [
+        ("endividamento_bcb", "Endividamento das Famílias (% renda 12m)", CORES["endividamento"], "%"),
+        ("comprometimento_renda", "Comprometimento de Renda (% renda 12m)", CORES["comprometimento"], "%"),
+        ("icc_indice", "Índice de Confiança do Consumidor", CORES["icc"], "índice"),
+        ("peic_endividadas", "Famílias Endividadas — PEIC (%)", CORES["peic_endiv"], "%"),
+        ("ipca", "IPCA Mensal (%)", CORES["ipca"], "%"),
+        ("selic", "Taxa Selic Meta (% a.a.)", CORES["selic"], "% a.a."),
+        ("desemprego", "Taxa de Desemprego (%)", CORES["desemprego"], "%"),
+        ("rendimento_medio", "Rendimento Médio Real (R$)", CORES["renda"], "R$"),
+    ]
+
+    fig = make_subplots(rows=4, cols=2, subplot_titles=[c[1] for c in configs],
+                        vertical_spacing=0.08, horizontal_spacing=0.08)
+
+    for i, (col, titulo, cor, unidade) in enumerate(configs):
+        row, colp = divmod(i, 2)
+        s = painel[col].dropna()
+        fig.add_trace(go.Scatter(
+            x=s.index, y=s.values, mode="lines",
+            line=dict(color=cor, width=1.5),
+            fill="tozeroy", fillcolor=cor.replace(")", ",0.08)").replace("rgb", "rgba") if cor.startswith("rgb") else None,
+            name=titulo,
+            hovertemplate=f"<b>{titulo}</b><br>%{{x|%b %Y}}<br>Valor: %{{y:.2f}} {unidade}<extra></extra>",
+            showlegend=False,
+        ), row=row + 1, col=colp + 1)
+
+    # Recessão shapes para todos os subplots
+    all_shapes = []
+    for idx in range(8):
+        xref = f"x{idx + 1}" if idx > 0 else "x"
+        for inicio, fim in [("2014-04-01", "2016-12-31"), ("2020-03-01", "2020-12-31")]:
+            all_shapes.append(dict(
+                type="rect", xref=xref, yref="paper",
+                x0=inicio, x1=fim, y0=0, y1=1,
+                fillcolor="gray", opacity=0.08, line_width=0,
+            ))
+
+    fig.update_layout(
+        height=900, shapes=all_shapes,
+        title=dict(text="Séries Temporais — Variáveis da Pesquisa (2012–2025)", font=dict(size=16)),
+        margin=dict(t=80, b=40),
+        hovermode="x unified",
+    )
+    fig.update_xaxes(dtick="M12", tickformat="%Y", tickangle=45)
+
+    return fig.to_html(include_plotlyjs=False, full_html=False, div_id="chart-series")
+
+
+def fig_endividamento_vs_icc(painel: pd.DataFrame) -> str:
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    s_endiv = painel["peic_endividadas"].dropna()
+    s_icc = painel["icc_indice"].dropna()
+
+    fig.add_trace(go.Scatter(
+        x=s_endiv.index, y=s_endiv.values, mode="lines",
+        line=dict(color=CORES["endividamento"], width=2),
+        name="Famílias Endividadas (PEIC, %)",
+        hovertemplate="%{x|%b %Y}<br>Endividadas: %{y:.1f}%<extra></extra>",
+    ), secondary_y=False)
+
+    fig.add_trace(go.Scatter(
+        x=s_icc.index, y=s_icc.values, mode="lines",
+        line=dict(color=CORES["icc"], width=2),
+        name="ICC (Fecomércio SP)",
+        hovertemplate="%{x|%b %Y}<br>ICC: %{y:.1f}<extra></extra>",
+    ), secondary_y=True)
+
+    fig.add_hline(y=100, line_dash="dash", line_color=CORES["icc"], opacity=0.3, secondary_y=True)
+
+    fig.update_layout(
+        title="Endividamento das Famílias vs. Confiança do Consumidor (2012–2025)",
+        height=420, shapes=_recessao_shapes(),
+        legend=dict(x=0, y=1.12, orientation="h"),
+        hovermode="x unified",
+    )
+    fig.update_yaxes(title_text="Famílias Endividadas (%)", secondary_y=False,
+                     title_font_color=CORES["endividamento"])
+    fig.update_yaxes(title_text="ICC", secondary_y=True,
+                     title_font_color=CORES["icc"])
+    fig.update_xaxes(dtick="M12", tickformat="%Y", tickangle=45)
+
+    return fig.to_html(include_plotlyjs=False, full_html=False, div_id="chart-hipotese1")
+
+
+def fig_comprometimento_vs_icc(painel: pd.DataFrame) -> str:
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    s_comp = painel["comprometimento_renda"].dropna()
+    s_icc = painel["icc_condicoes_atuais"].dropna()
+
+    fig.add_trace(go.Scatter(
+        x=s_comp.index, y=s_comp.values, mode="lines",
+        line=dict(color=CORES["comprometimento"], width=2),
+        name="Comprometimento de Renda (BCB, %)",
+        hovertemplate="%{x|%b %Y}<br>Comprom.: %{y:.1f}%<extra></extra>",
+    ), secondary_y=False)
+
+    fig.add_trace(go.Scatter(
+        x=s_icc.index, y=s_icc.values, mode="lines",
+        line=dict(color=CORES["icc_atuais"], width=2),
+        name="ICC — Condições Atuais",
+        hovertemplate="%{x|%b %Y}<br>ICC Atuais: %{y:.1f}<extra></extra>",
+    ), secondary_y=True)
+
+    fig.update_layout(
+        title="Comprometimento de Renda vs. Percepção da Situação Atual (2012–2025)",
+        height=420, shapes=_recessao_shapes(),
+        legend=dict(x=0, y=1.12, orientation="h"),
+        hovermode="x unified",
+    )
+    fig.update_yaxes(title_text="Comprometimento de Renda (%)", secondary_y=False,
+                     title_font_color=CORES["comprometimento"])
+    fig.update_yaxes(title_text="ICC — Condições Atuais", secondary_y=True,
+                     title_font_color=CORES["icc_atuais"])
+    fig.update_xaxes(dtick="M12", tickformat="%Y", tickangle=45)
+
+    return fig.to_html(include_plotlyjs=False, full_html=False, div_id="chart-hipotese2")
+
+
+def fig_correlacao(painel: pd.DataFrame) -> str:
+    colunas = [
+        "endividamento_bcb", "comprometimento_renda", "peic_endividadas", "peic_atraso",
+        "peic_renda_comp", "icc_indice", "icc_condicoes_atuais", "icc_expectativas",
+        "ipca", "selic", "spread_pf", "inadimplencia", "desemprego", "rendimento_medio",
+    ]
+    nomes = [
+        "Endivid. BCB", "Comprom. Renda", "PEIC Endivid.", "PEIC Atraso",
+        "PEIC Renda Comp.", "ICC Geral", "ICC Atuais", "ICC Expectat.",
+        "IPCA", "Selic", "Spread PF", "Inadimpl.", "Desemprego", "Rend. Médio",
+    ]
+
+    df_corr = painel[colunas].dropna()
+    corr = df_corr.corr().values
+
+    # Mascarar triângulo superior
+    mask = np.triu(np.ones_like(corr, dtype=bool), k=1)
+    corr_masked = np.where(mask, np.nan, corr)
+
+    # Texto para hover
+    text = []
+    for i in range(len(nomes)):
+        row_text = []
+        for j in range(len(nomes)):
+            if mask[i, j]:
+                row_text.append("")
+            else:
+                row_text.append(f"{nomes[i]} × {nomes[j]}<br>r = {corr[i, j]:.3f}")
+        text.append(row_text)
+
+    fig = go.Figure(data=go.Heatmap(
+        z=corr_masked, x=nomes, y=nomes,
+        colorscale="RdBu_r", zmid=0, zmin=-1, zmax=1,
+        text=text, hovertemplate="%{text}<extra></extra>",
+        texttemplate="%{z:.2f}",
+        textfont=dict(size=9),
+    ))
+
+    fig.update_layout(
+        title="Matriz de Correlação — Variáveis da Pesquisa",
+        height=650, width=750,
+        xaxis=dict(tickangle=45, tickfont=dict(size=10)),
+        yaxis=dict(tickfont=dict(size=10), autorange="reversed"),
+        margin=dict(l=120, b=120),
+    )
+
+    return fig.to_html(include_plotlyjs=False, full_html=False, div_id="chart-corr")
+
+
+def fig_cross_correlation(painel: pd.DataFrame) -> str:
+    pares = [
+        ("peic_endividadas", "icc_indice", "PEIC Endividadas vs. ICC"),
+        ("comprometimento_renda", "icc_indice", "Comprom. Renda vs. ICC"),
+        ("comprometimento_renda", "icc_condicoes_atuais", "Comprom. Renda vs. ICC Atuais"),
+    ]
+
+    fig = make_subplots(rows=1, cols=3, subplot_titles=[p[2] for p in pares],
+                        horizontal_spacing=0.08)
+
+    max_lags = 24
+
+    for idx, (col_x, col_y, titulo) in enumerate(pares):
+        df_pair = painel[[col_x, col_y]].dropna()
+        x = df_pair[col_x].values
+        y = df_pair[col_y].values
+
+        x = (x - x.mean()) / x.std()
+        y = (y - y.mean()) / y.std()
+
+        correlacoes = []
+        lags = list(range(-max_lags, max_lags + 1))
+        for lag in lags:
+            if lag >= 0:
+                corr = np.corrcoef(x[:len(x) - lag], y[lag:])[0, 1]
+            else:
+                corr = np.corrcoef(x[-lag:], y[:len(y) + lag])[0, 1]
+            correlacoes.append(corr)
+
+        cores_barras = [CORES["endividamento"] if c < 0 else CORES["icc"] for c in correlacoes]
+
+        fig.add_trace(go.Bar(
+            x=lags, y=correlacoes,
+            marker_color=cores_barras,
+            hovertemplate="Lag: %{x} meses<br>Correlação: %{y:.3f}<extra></extra>",
+            showlegend=False,
+        ), row=1, col=idx + 1)
+
+        # Limites de significância
+        n = len(df_pair)
+        sig = 2 / np.sqrt(n)
+        for val in [sig, -sig]:
+            fig.add_hline(y=val, line_dash="dash", line_color="gray", opacity=0.5,
+                          row=1, col=idx + 1)
+
+        # Anotar pico
+        idx_pico = int(np.argmin(correlacoes))
+        lag_pico = lags[idx_pico]
+        corr_pico = correlacoes[idx_pico]
+        fig.add_annotation(
+            x=lag_pico, y=corr_pico,
+            text=f"lag={lag_pico}<br>r={corr_pico:.2f}",
+            showarrow=True, arrowhead=2, font=dict(size=10),
+            bgcolor="white", bordercolor="gray",
+            row=1, col=idx + 1,
+        )
+
+    fig.update_layout(
+        height=400,
+        title=dict(text="Cross-Correlation: Endividamento → Confiança do Consumidor", font=dict(size=14)),
+        margin=dict(t=80, b=60),
+    )
+    fig.update_xaxes(title_text="Defasagem (meses)")
+    fig.update_yaxes(title_text="Correlação", col=1)
+
+    return fig.to_html(include_plotlyjs=False, full_html=False, div_id="chart-crosscorr")
+
+
+def fig_scatter(painel: pd.DataFrame) -> str:
+    pares = [
+        ("peic_endividadas", "icc_indice", "PEIC Endividadas (%)", "ICC Geral"),
+        ("comprometimento_renda", "icc_indice", "Comprometimento Renda (%)", "ICC Geral"),
+        ("comprometimento_renda", "icc_condicoes_atuais", "Comprometimento Renda (%)", "ICC Cond. Atuais"),
+    ]
+
+    fig = make_subplots(rows=1, cols=3, subplot_titles=[
+        f"{lx} vs. {ly}" for _, _, lx, ly in pares
+    ], horizontal_spacing=0.08)
+
+    for idx, (col_x, col_y, label_x, label_y) in enumerate(pares):
+        df_pair = painel[[col_x, col_y]].dropna()
+        x, y = df_pair[col_x], df_pair[col_y]
+
+        slope, intercept, r_value, p_value, _ = stats.linregress(x, y)
+        x_line = np.linspace(x.min(), x.max(), 100)
+
+        fig.add_trace(go.Scatter(
+            x=x, y=y, mode="markers",
+            marker=dict(color=CORES["endividamento"], size=5, opacity=0.5),
+            customdata=df_pair.index.strftime("%b %Y"),
+            hovertemplate=f"<b>%{{customdata}}</b><br>{label_x}: %{{x:.2f}}<br>{label_y}: %{{y:.1f}}<extra></extra>",
+            showlegend=False,
+        ), row=1, col=idx + 1)
+
+        fig.add_trace(go.Scatter(
+            x=x_line, y=intercept + slope * x_line, mode="lines",
+            line=dict(color=CORES["icc"], width=2, dash="dash"),
+            hoverinfo="skip", showlegend=False,
+        ), row=1, col=idx + 1)
+
+        # Anotar r e p
+        xref = "x domain" if idx == 0 else f"x{idx + 1} domain"
+        yref = "y domain" if idx == 0 else f"y{idx + 1} domain"
+        fig.add_annotation(
+            x=0.5, y=1.0, xref=xref, yref=yref,
+            text=f"r = {r_value:.3f} (p = {p_value:.1e})",
+            showarrow=False, font=dict(size=11, color=CORES["icc"]),
+            bgcolor="white", bordercolor=CORES["icc"], borderpad=3,
+        )
+
+        fig.update_xaxes(title_text=label_x, row=1, col=idx + 1)
+        fig.update_yaxes(title_text=label_y, row=1, col=idx + 1)
+
+    fig.update_layout(
+        height=420,
+        title=dict(text="Relação entre Endividamento e Confiança do Consumidor", font=dict(size=14)),
+        margin=dict(t=80, b=60),
+    )
+
+    return fig.to_html(include_plotlyjs=False, full_html=False, div_id="chart-scatter")
+
+
+# ============================================================
+# Tabelas (carregadas dos CSVs já gerados)
+# ============================================================
 
 def carregar_tabela_csv(caminho: Path) -> pd.DataFrame:
-    """Carrega CSV como DataFrame."""
     return pd.read_csv(caminho, index_col=0 if "descritivas" in str(caminho) else None)
 
 
-def gerar_html():
-    # Carregar tabelas
-    df_estac = carregar_tabela_csv(TABELAS / "testes_estacionariedade.csv")
-    df_desc = carregar_tabela_csv(TABELAS / "estatisticas_descritivas.csv")
-
-    # Converter imagens
-    imgs = {}
-    for f in sorted(GRAFICOS.glob("*.png")):
-        imgs[f.stem] = img_to_base64(f)
-
-    # Montar tabela de estacionariedade em HTML
-    estac_rows = ""
+def tabela_estacionariedade_html(df_estac: pd.DataFrame) -> str:
+    rows = ""
     for _, row in df_estac.iterrows():
         diag = row["Diagnóstico (nível)"]
         if "Estacionária" == diag:
@@ -59,24 +474,22 @@ def gerar_html():
         else:
             id_badge = '<span class="badge badge-danger">I(2)?</span>'
 
-        adf_p = float(row["ADF p-valor"])
-        kpss_p = float(row["KPSS p-valor"])
-        adf_d_p = float(row["ADF 1ª dif. p-valor"])
-
-        estac_rows += f"""
+        rows += f"""
         <tr>
             <td class="var-name">{row["Variável"]}</td>
-            <td class="num">{adf_p:.4f}</td>
-            <td class="num">{kpss_p:.4f}</td>
+            <td class="num">{float(row["ADF p-valor"]):.4f}</td>
+            <td class="num">{float(row["KPSS p-valor"]):.4f}</td>
             <td>{badge}</td>
-            <td class="num">{adf_d_p:.4f}</td>
+            <td class="num">{float(row["ADF 1ª dif. p-valor"]):.4f}</td>
             <td>{id_badge}</td>
         </tr>"""
+    return rows
 
-    # Tabela descritiva
-    desc_rows = ""
+
+def tabela_descritivas_html(df_desc: pd.DataFrame) -> str:
+    rows = ""
     for idx, row in df_desc.iterrows():
-        desc_rows += f"""
+        rows += f"""
         <tr>
             <td class="var-name">{idx}</td>
             <td class="num">{row['N']:.0f}</td>
@@ -86,6 +499,38 @@ def gerar_html():
             <td class="num">{row['Mediana']:.2f}</td>
             <td class="num">{row['Máx']:.2f}</td>
         </tr>"""
+    return rows
+
+
+# ============================================================
+# Montagem do HTML
+# ============================================================
+
+def _tooltip_html(key: str) -> str:
+    text = TOOLTIPS.get(key, "")
+    return f'<span class="info-tooltip">ℹ<span class="info-tooltip-text">{text}</span></span>'
+
+
+def gerar_html():
+    print("Carregando dados...")
+    dados = carregar_dados()
+    painel = construir_painel_mensal(dados)
+    print(f"  Painel: {painel.shape[0]} meses x {painel.shape[1]} variáveis")
+
+    # Tabelas
+    df_estac = carregar_tabela_csv(TABELAS / "testes_estacionariedade.csv")
+    df_desc = carregar_tabela_csv(TABELAS / "estatisticas_descritivas.csv")
+    estac_rows = tabela_estacionariedade_html(df_estac)
+    desc_rows = tabela_descritivas_html(df_desc)
+
+    # Gráficos Plotly
+    print("Gerando gráficos interativos...")
+    chart_series = fig_painel_series(painel)
+    chart_hipotese1 = fig_endividamento_vs_icc(painel)
+    chart_hipotese2 = fig_comprometimento_vs_icc(painel)
+    chart_corr = fig_correlacao(painel)
+    chart_crosscorr = fig_cross_correlation(painel)
+    chart_scatter = fig_scatter(painel)
 
     html = f"""<!DOCTYPE html>
 <html lang="pt-BR">
@@ -93,6 +538,7 @@ def gerar_html():
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Análise Exploratória — Endividamento e Percepção Econômica</title>
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
     <style>
         :root {{
             --azul: #1a3c78;
@@ -113,7 +559,6 @@ def gerar_html():
             line-height: 1.6;
         }}
 
-        /* NAV */
         nav {{
             position: fixed;
             top: 0;
@@ -149,14 +594,12 @@ def gerar_html():
         }}
         nav a:hover {{ color: white; border-bottom-color: rgba(255,255,255,0.5); }}
 
-        /* MAIN */
         main {{
             max-width: 1100px;
             margin: 0 auto;
             padding: 70px 24px 60px;
         }}
 
-        /* HEADER */
         .header {{
             text-align: center;
             padding: 48px 0 36px;
@@ -176,7 +619,6 @@ def gerar_html():
             color: var(--texto-leve);
         }}
 
-        /* SECTIONS */
         section {{
             background: white;
             border-radius: 10px;
@@ -191,6 +633,9 @@ def gerar_html():
             margin-bottom: 6px;
             padding-bottom: 10px;
             border-bottom: 2px solid var(--cinza-borda);
+            display: flex;
+            align-items: center;
+            gap: 10px;
         }}
         section h3 {{
             font-size: 15px;
@@ -202,6 +647,7 @@ def gerar_html():
             font-size: 14px;
             color: var(--texto);
         }}
+
         .insight {{
             background: #eef4fb;
             border-left: 4px solid var(--azul-claro);
@@ -228,40 +674,10 @@ def gerar_html():
             font-size: 14px;
         }}
 
-        /* IMAGES */
-        .grafico {{
-            text-align: center;
+        .chart-container {{
             margin: 20px 0;
         }}
-        .grafico img {{
-            max-width: 100%;
-            border-radius: 6px;
-            border: 1px solid var(--cinza-borda);
-            cursor: zoom-in;
-            transition: transform 0.2s;
-        }}
-        .grafico img:hover {{ transform: scale(1.01); }}
-        .grafico img.zoomed {{
-            position: fixed;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%) scale(1);
-            max-width: 95vw;
-            max-height: 95vh;
-            z-index: 2000;
-            cursor: zoom-out;
-            border: 3px solid white;
-            box-shadow: 0 0 0 9999px rgba(0,0,0,0.7);
-            border-radius: 8px;
-        }}
-        .grafico .caption {{
-            font-size: 12px;
-            color: var(--texto-leve);
-            margin-top: 8px;
-            font-style: italic;
-        }}
 
-        /* TABLES */
         table {{
             width: 100%;
             border-collapse: collapse;
@@ -287,7 +703,6 @@ def gerar_html():
         .var-name {{ font-weight: 600; color: var(--azul); }}
         .num {{ font-family: 'Consolas', 'Fira Mono', monospace; text-align: right; }}
 
-        /* BADGES */
         .badge {{
             display: inline-block;
             padding: 2px 10px;
@@ -300,14 +715,65 @@ def gerar_html():
         .badge-danger {{ background: #fadbd8; color: #922b21; }}
         .badge-neutral {{ background: #eaecee; color: #5d6d7e; }}
 
-        /* CORRELATION HIGHLIGHT */
         .corr-table td.neg-strong {{ background: #f5b7b1; font-weight: 700; }}
         .corr-table td.neg-mod {{ background: #fadbd8; }}
         .corr-table td.pos-strong {{ background: #aed6f1; font-weight: 700; }}
         .corr-table td.pos-mod {{ background: #d6eaf8; }}
         .corr-table td.ns {{ color: #aab7b8; }}
 
-        /* FOOTER */
+        /* Info tooltip */
+        .info-tooltip {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 22px;
+            height: 22px;
+            border-radius: 50%;
+            background: var(--azul-claro);
+            color: white;
+            font-size: 13px;
+            font-weight: 700;
+            font-style: italic;
+            cursor: help;
+            position: relative;
+            flex-shrink: 0;
+        }}
+        .info-tooltip .info-tooltip-text {{
+            visibility: hidden;
+            opacity: 0;
+            position: absolute;
+            top: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #2c3e50;
+            color: white;
+            padding: 12px 16px;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 400;
+            font-style: normal;
+            line-height: 1.5;
+            width: 340px;
+            z-index: 100;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+            transition: opacity 0.2s;
+            pointer-events: none;
+        }}
+        .info-tooltip .info-tooltip-text::before {{
+            content: "";
+            position: absolute;
+            bottom: 100%;
+            left: 50%;
+            margin-left: -6px;
+            border-width: 6px;
+            border-style: solid;
+            border-color: transparent transparent #2c3e50 transparent;
+        }}
+        .info-tooltip:hover .info-tooltip-text {{
+            visibility: visible;
+            opacity: 1;
+        }}
+
         footer {{
             text-align: center;
             padding: 24px;
@@ -336,26 +802,23 @@ def gerar_html():
 
 <div class="header">
     <h1>Endividamento Familiar e Percepção Econômica no Brasil</h1>
-    <div class="subtitle">Análise Exploratória dos Dados — Relatório Completo</div>
-    <div class="meta">Juliane Furno &middot; Período: 2012–2025 &middot; 14 variáveis &middot; 171 observações mensais</div>
+    <div class="subtitle">Análise Exploratória dos Dados — Relatório Interativo</div>
+    <div class="meta">Juliane Furno &middot; Período: 2012–2025 &middot; 14 variáveis &middot; {len(painel)} observações mensais</div>
 </div>
 
 <!-- ============================================================ -->
 <section id="series">
-    <h2>1. Painel de Séries Temporais</h2>
+    <h2>1. Painel de Séries Temporais {_tooltip_html("series")}</h2>
     <p>Visão geral das oito variáveis principais da pesquisa ao longo de 2012–2025. As faixas cinza marcam a recessão de 2014–16 e a pandemia de 2020.</p>
 
-    <div class="grafico">
-        <img src="data:image/png;base64,{imgs.get('01_painel_series_temporais', '')}" alt="Painel de séries temporais">
-        <div class="caption">Figura 1 — Séries temporais das variáveis-chave (clique para ampliar)</div>
-    </div>
+    <div class="chart-container">{chart_series}</div>
 
     <h3>Observações iniciais</h3>
     <div class="insight">
         <strong>Endividamento em tendência de alta:</strong> tanto o indicador BCB (36% → 50%) quanto a PEIC (56% → 80%) mostram crescimento persistente no período, com aceleração pós-2020. Trata-se de uma tendência estrutural de financeirização do consumo das famílias.
     </div>
     <div class="insight">
-        <strong>ICC volátil com ciclos claros:</strong> a confiança do consumidor despencou na recessão 2015–16 (de 170 para 84), recuperou parcialmente, caiu novamente na pandemia, e voltou a subir desde 2022. O subíndice de Condições Atuais (não mostrado aqui) é o mais sensível.
+        <strong>ICC volátil com ciclos claros:</strong> a confiança do consumidor despencou na recessão 2015–16 (de 170 para 84), recuperou parcialmente, caiu novamente na pandemia, e voltou a subir desde 2022. O subíndice de Condições Atuais é o mais sensível.
     </div>
     <div class="insight">
         <strong>Desemprego e renda como contexto:</strong> o desemprego subiu de 7% para 14% na recessão e voltou a cair para 5% em 2025. O rendimento médio real mostra recuperação recente (R$ 3.742), mas a pergunta é: quanto dessa renda está comprometida com dívida?
@@ -364,22 +827,16 @@ def gerar_html():
 
 <!-- ============================================================ -->
 <section id="hipotese">
-    <h2>2. Hipótese Central: Endividamento vs. Confiança</h2>
+    <h2>2. Hipótese Central: Endividamento vs. Confiança {_tooltip_html("hipotese")}</h2>
     <p>Gráfico de dois eixos sobrepondo o percentual de famílias endividadas (PEIC) e o Índice de Confiança do Consumidor (ICC).</p>
 
-    <div class="grafico">
-        <img src="data:image/png;base64,{imgs.get('02_endividamento_vs_icc', '')}" alt="Endividamento vs ICC">
-        <div class="caption">Figura 2 — PEIC Famílias Endividadas (%, eixo esquerdo) vs. ICC (eixo direito)</div>
-    </div>
+    <div class="chart-container">{chart_hipotese1}</div>
 
     <div class="key-finding">
         <strong>Achado central:</strong> visualmente, há uma <strong>relação inversa clara</strong> entre endividamento e confiança — quando o endividamento sobe, o ICC tende a cair, e vice-versa. No entanto, de 2022 em diante, ambos sobem simultaneamente, rompendo esse padrão. Isso sugere que o nível absoluto de endividamento não é o único determinante — o <strong>contexto macroeconômico</strong> (emprego, renda) media essa relação.
     </div>
 
-    <div class="grafico">
-        <img src="data:image/png;base64,{imgs.get('03_comprometimento_vs_icc_atuais', '')}" alt="Comprometimento vs ICC Atuais">
-        <div class="caption">Figura 3 — Comprometimento de Renda (BCB, %) vs. ICC Condições Atuais</div>
-    </div>
+    <div class="chart-container">{chart_hipotese2}</div>
 
     <div class="insight">
         <strong>Comprometimento de renda vs. percepção:</strong> este gráfico revela um padrão interessante. Na recessão 2015–16, o comprometimento de renda caiu (famílias cortaram crédito) enquanto a percepção despencou — ou seja, foi o desemprego, não a dívida, que destruiu a confiança. Pós-2020, ambos sobem juntos, sugerindo que famílias estão se endividando mais num contexto de recuperação (crédito de expansão, não de sobrevivência).
@@ -388,13 +845,10 @@ def gerar_html():
 
 <!-- ============================================================ -->
 <section id="correlacoes">
-    <h2>3. Matriz de Correlação</h2>
+    <h2>3. Matriz de Correlação {_tooltip_html("correlacoes")}</h2>
     <p>Correlação de Pearson entre as 14 variáveis do painel, usando observações mensais simultâneas.</p>
 
-    <div class="grafico">
-        <img src="data:image/png;base64,{imgs.get('04_matriz_correlacao', '')}" alt="Matriz de correlação">
-        <div class="caption">Figura 4 — Matriz de correlação (triângulo inferior). Vermelho = correlação positiva, azul = negativa.</div>
-    </div>
+    <div class="chart-container">{chart_corr}</div>
 
     <h3>Correlações-chave para a hipótese</h3>
     <table class="corr-table">
@@ -478,13 +932,10 @@ def gerar_html():
 
 <!-- ============================================================ -->
 <section id="crosscorr">
-    <h2>4. Cross-Correlation: Quem Precede Quem?</h2>
+    <h2>4. Cross-Correlation: Quem Precede Quem? {_tooltip_html("crosscorr")}</h2>
     <p>Análise de correlação cruzada com defasagens de até 24 meses. Lag positivo = endividamento precede ICC; lag negativo = ICC precede endividamento.</p>
 
-    <div class="grafico">
-        <img src="data:image/png;base64,{imgs.get('05_cross_correlation', '')}" alt="Cross-correlation">
-        <div class="caption">Figura 5 — Cross-correlation entre medidas de endividamento e ICC. Linhas tracejadas = limites de significância a 5%.</div>
-    </div>
+    <div class="chart-container">{chart_crosscorr}</div>
 
     <div class="key-finding">
         <strong>Padrão temporal:</strong> a correlação negativa mais forte ocorre com <strong>lags negativos</strong> (ICC nos meses anteriores). Isso sugere que <strong>a queda de confiança precede o aumento do endividamento</strong> — ou seja, famílias que percebem piora econômica recorrem mais ao crédito. Esse achado é consistente com a ideia de <strong>crédito como mecanismo de sobrevivência</strong> na perspectiva marxista.
@@ -496,13 +947,10 @@ def gerar_html():
 
 <!-- ============================================================ -->
 <section id="scatter">
-    <h2>5. Gráficos de Dispersão</h2>
+    <h2>5. Gráficos de Dispersão {_tooltip_html("scatter")}</h2>
     <p>Relação entre medidas de endividamento e confiança do consumidor, com linha de tendência (OLS).</p>
 
-    <div class="grafico">
-        <img src="data:image/png;base64,{imgs.get('06_scatter_hipotese', '')}" alt="Scatter plots">
-        <div class="caption">Figura 6 — Scatter plots com coeficiente de correlação e p-valor. Linha tracejada = regressão linear simples.</div>
-    </div>
+    <div class="chart-container">{chart_scatter}</div>
 
     <div class="insight">
         <strong>PEIC Endividadas vs. ICC (r = -0.042):</strong> nuvem dispersa, sem relação linear. O <strong>nível</strong> de endividamento é insuficiente para explicar percepção — o que importa é o <strong>custo</strong> dessa dívida.
@@ -514,7 +962,7 @@ def gerar_html():
 
 <!-- ============================================================ -->
 <section id="estacionariedade">
-    <h2>6. Testes de Estacionariedade</h2>
+    <h2>6. Testes de Estacionariedade {_tooltip_html("estacionariedade")}</h2>
     <p>Testes ADF (H₀: raiz unitária) e KPSS (H₀: estacionária) para cada variável em nível e em primeira diferença.</p>
 
     <table>
@@ -548,7 +996,7 @@ def gerar_html():
 
 <!-- ============================================================ -->
 <section id="descritivas">
-    <h2>7. Estatísticas Descritivas</h2>
+    <h2>7. Estatísticas Descritivas {_tooltip_html("descritivas")}</h2>
 
     <table>
         <thead>
@@ -574,7 +1022,7 @@ def gerar_html():
 
 <!-- ============================================================ -->
 <section id="sintese">
-    <h2>8. Síntese e Implicações para o Modelo</h2>
+    <h2>8. Síntese e Implicações para o Modelo {_tooltip_html("sintese")}</h2>
 
     <h3>O que os dados dizem sobre a hipótese?</h3>
 
@@ -608,24 +1056,10 @@ def gerar_html():
 
 <footer>
     Análise Exploratória — Endividamento Familiar e Percepção Econômica no Brasil<br>
-    Juliane Furno &middot; Gerado automaticamente via Python
+    Juliane Furno &middot; Gerado automaticamente via Python (gráficos interativos Plotly)
 </footer>
 
 <script>
-    // Zoom em imagens
-    document.querySelectorAll('.grafico img').forEach(img => {{
-        img.addEventListener('click', () => {{
-            img.classList.toggle('zoomed');
-        }});
-    }});
-    // ESC para fechar zoom
-    document.addEventListener('keydown', e => {{
-        if (e.key === 'Escape') {{
-            document.querySelectorAll('.grafico img.zoomed').forEach(img => {{
-                img.classList.remove('zoomed');
-            }});
-        }}
-    }});
     // Smooth scroll
     document.querySelectorAll('nav a').forEach(a => {{
         a.addEventListener('click', e => {{
@@ -646,7 +1080,6 @@ def gerar_html():
     print(f"HTML gerado: {SAIDA}")
     print(f"Tamanho: {SAIDA.stat().st_size / 1024:.0f} KB")
 
-    # Abrir no navegador
     webbrowser.open(str(SAIDA.resolve()))
     print("Aberto no navegador.")
 
